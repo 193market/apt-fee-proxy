@@ -203,7 +203,8 @@ def parse_items(xml_str: str) -> list[dict]:
 
 def get_mgcost(kapt_code: str) -> dict | None:
     """
-    관리비 실데이터 조회
+    공용관리비 실데이터 조회 (AptCmnuseManageCostServiceV2)
+    항목별 API를 병렬 호출하여 합산 반환
     최근 6개월 중 데이터 있는 월 반환
     """
     cache_key = f"mgcost_{kapt_code}"
@@ -211,40 +212,52 @@ def get_mgcost(kapt_code: str) -> dict | None:
     if cached:
         return cached
 
-    BASE = "https://apis.data.go.kr/1613000/AptMgCostInfoServiceV2/getAptMgCostInfo"
+    # 공용관리비 항목별 오퍼레이션 (정확한 이름 확인됨)
+    BASE_V2 = "https://apis.data.go.kr/1613000/AptCmnuseManageCostServiceV2"
+    OPS = {
+        "guardCost":       "getHsmpGuardCostInfoV2",        # 경비비
+        "cleaningCost":    "getHsmpCleaningCostInfoV2",     # 청소비
+        "laborCost":       "getHsmpLaborCostInfoV2",        # 인건비
+        "elevatorCost":    "getHsmpElevatorMntncCostInfoV2",# 승강기유지비
+        "disinfectCost":   "getHsmpDisinfectionCostInfoV2", # 소독비
+        "repairCost":      "getHsmpRepairsCostInfoV2",      # 수선비
+        "facilityMntnc":   "getHsmpFacilityMntncCostInfoV2",# 시설유지비
+        "taxdue":          "getHsmpTaxdueInfoV2",           # 제세공과금
+        "laborSalary":     "getHsmpLaborCostInfoV2",        # 인건비(중복 방지용 키 다름)
+        "consignFee":      "getHsmpConsignManageFeeInfoV2", # 위탁관리수수료
+    }
 
     for months_ago in range(1, 7):
         d = datetime.now().replace(day=1) - timedelta(days=months_ago * 28)
         year = str(d.year)
         month = str(d.month).zfill(2)
+        params = {"kaptCode": kapt_code, "searchYear": year, "searchMonth": month, "numOfRows": "1", "pageNo": "1"}
 
-        xml = call_api(BASE, {"kaptCode": kapt_code, "searchYear": year, "searchMonth": month})
-        if xml:
-            items = parse_items(xml)
-            if items:
-                result = items[0]
-                result["year"] = year
-                result["month"] = month
-                set_cache(cache_key, result)
-                print(f"mgcost found for {kapt_code}: {year}-{month}")
-                return result
+        # 경비비로 데이터 존재 여부 확인
+        guard_xml = call_api(f"{BASE_V2}/{OPS['guardCost']}", params)
+        if not guard_xml:
+            continue
+        guard_items = parse_items(guard_xml)
+        if not guard_items:
+            continue
 
-    # 개별사용료 API도 시도
-    BASE2 = "https://apis.data.go.kr/1613000/AptIndvdlzManageCostServiceV2/getAptIndvdlzManageCostInfo"
-    for months_ago in range(1, 7):
-        d = datetime.now().replace(day=1) - timedelta(days=months_ago * 28)
-        year = str(d.year)
-        month = str(d.month).zfill(2)
-        xml = call_api(BASE2, {"kaptCode": kapt_code, "searchYear": year, "searchMonth": month})
-        if xml:
-            items = parse_items(xml)
-            if items:
-                result = items[0]
-                result["year"] = year
-                result["month"] = month
-                result["source"] = "individual"
-                set_cache(cache_key, result)
-                return result
+        # 데이터 있는 월 확인 — 항목별 호출
+        result = {"year": year, "month": month, "source": "real"}
+        for key, op in OPS.items():
+            xml = call_api(f"{BASE_V2}/{op}", params)
+            if xml:
+                items = parse_items(xml)
+                if items:
+                    # 금액 필드 찾기 (amt, cost, fee 등 키 포함)
+                    item = items[0]
+                    for field, val in item.items():
+                        if val and field not in result:
+                            result[field] = val
+            result[key] = items[0] if (xml and parse_items(xml)) else None
+
+        set_cache(cache_key, result)
+        print(f"mgcost(real) found for {kapt_code}: {year}-{month}")
+        return result
 
     print(f"mgcost not found for {kapt_code}")
     return None
