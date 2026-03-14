@@ -7,7 +7,6 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
-import xml.etree.ElementTree as ET
 import time
 import json
 import re
@@ -174,86 +173,76 @@ def find_kapt_code(sgg_cd: str, apt_nm: str, jibun: str = "", build_year: str = 
     return None
 
 
-def call_api(url: str, params: dict) -> str | None:
-    """공공데이터 API 호출"""
+def call_api(url: str, params: dict) -> dict | None:
+    """공공데이터 API 호출 — JSON 응답 반환"""
     params["serviceKey"] = API_KEY
     try:
         res = requests.get(url, params=params, headers=HEADERS, timeout=10)
         if res.status_code == 200:
-            return res.text
+            return res.json()
     except Exception as e:
         print(f"API call failed: {e}")
     return None
 
 
-def parse_items(xml_str: str) -> list[dict]:
-    """XML 응답에서 item 목록 파싱"""
+def parse_item(data: dict | None) -> dict | None:
+    """JSON 응답에서 item 추출. 값이 모두 null이면 None 반환."""
+    if not data:
+        return None
     try:
-        root = ET.fromstring(xml_str)
-        result_code = root.findtext(".//resultCode", "")
-        if result_code and result_code != "000":
-            print(f"API resultCode: {result_code} - {root.findtext('.//resultMsg', '')}")
-            return []
-        items = root.findall(".//item")
-        return [{child.tag: child.text for child in item} for item in items]
+        header = data.get("response", {}).get("header", {})
+        if header.get("resultCode") not in ("00", "000", None):
+            print(f"API resultCode: {header}")
+            return None
+        item = data.get("response", {}).get("body", {}).get("item", {})
+        if not item or not any(v for v in item.values() if v):
+            return None
+        return item
     except Exception as e:
-        print(f"XML parse error: {e}")
-        return []
+        print(f"JSON parse error: {e}")
+        return None
 
 
 def get_mgcost(kapt_code: str) -> dict | None:
     """
     공용관리비 실데이터 조회 (AptCmnuseManageCostServiceV2)
-    항목별 API를 병렬 호출하여 합산 반환
-    최근 6개월 중 데이터 있는 월 반환
+    최근 24개월 중 데이터가 있는 월 반환. 없으면 None.
     """
     cache_key = f"mgcost_{kapt_code}"
     cached = get_cache(cache_key)
     if cached:
         return cached
 
-    # 공용관리비 항목별 오퍼레이션 (정확한 이름 확인됨)
     BASE_V2 = "https://apis.data.go.kr/1613000/AptCmnuseManageCostServiceV2"
     OPS = {
-        "guardCost":       "getHsmpGuardCostInfoV2",        # 경비비
-        "cleaningCost":    "getHsmpCleaningCostInfoV2",     # 청소비
-        "laborCost":       "getHsmpLaborCostInfoV2",        # 인건비
-        "elevatorCost":    "getHsmpElevatorMntncCostInfoV2",# 승강기유지비
-        "disinfectCost":   "getHsmpDisinfectionCostInfoV2", # 소독비
-        "repairCost":      "getHsmpRepairsCostInfoV2",      # 수선비
-        "facilityMntnc":   "getHsmpFacilityMntncCostInfoV2",# 시설유지비
-        "taxdue":          "getHsmpTaxdueInfoV2",           # 제세공과금
-        "laborSalary":     "getHsmpLaborCostInfoV2",        # 인건비(중복 방지용 키 다름)
-        "consignFee":      "getHsmpConsignManageFeeInfoV2", # 위탁관리수수료
+        "guardCost":     "getHsmpGuardCostInfoV2",
+        "cleaningCost":  "getHsmpCleaningCostInfoV2",
+        "laborCost":     "getHsmpLaborCostInfoV2",
+        "elevatorCost":  "getHsmpElevatorMntncCostInfoV2",
+        "disinfectCost": "getHsmpDisinfectionCostInfoV2",
+        "repairCost":    "getHsmpRepairsCostInfoV2",
+        "facilityMntnc": "getHsmpFacilityMntncCostInfoV2",
+        "taxdue":        "getHsmpTaxdueInfoV2",
+        "consignFee":    "getHsmpConsignManageFeeInfoV2",
     }
 
-    for months_ago in range(1, 7):
+    for months_ago in range(1, 25):
         d = datetime.now().replace(day=1) - timedelta(days=months_ago * 28)
         year = str(d.year)
         month = str(d.month).zfill(2)
         params = {"kaptCode": kapt_code, "searchYear": year, "searchMonth": month, "numOfRows": "1", "pageNo": "1"}
 
-        # 경비비로 데이터 존재 여부 확인
-        guard_xml = call_api(f"{BASE_V2}/{OPS['guardCost']}", params)
-        if not guard_xml:
-            continue
-        guard_items = parse_items(guard_xml)
-        if not guard_items:
+        # 경비비로 데이터 존재 여부 먼저 확인
+        guard_data = call_api(f"{BASE_V2}/{OPS['guardCost']}", params)
+        guard_item = parse_item(guard_data)
+        if not guard_item:
             continue
 
-        # 데이터 있는 월 확인 — 항목별 호출
+        # 데이터 있는 월 — 항목별 호출
         result = {"year": year, "month": month, "source": "real"}
         for key, op in OPS.items():
-            xml = call_api(f"{BASE_V2}/{op}", params)
-            if xml:
-                items = parse_items(xml)
-                if items:
-                    # 금액 필드 찾기 (amt, cost, fee 등 키 포함)
-                    item = items[0]
-                    for field, val in item.items():
-                        if val and field not in result:
-                            result[field] = val
-            result[key] = items[0] if (xml and parse_items(xml)) else None
+            item = parse_item(call_api(f"{BASE_V2}/{op}", params))
+            result[key] = item
 
         set_cache(cache_key, result)
         print(f"mgcost(real) found for {kapt_code}: {year}-{month}")
